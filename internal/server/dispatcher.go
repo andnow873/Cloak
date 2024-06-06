@@ -122,6 +122,37 @@ func readFirstPacket(conn net.Conn, buf []byte, timeout time.Duration) (int, Tra
 	return bufOffset, transport, true, nil
 }
 
+var extSNI = [2]byte{0x00, 0x00}
+
+func getSNI(data []byte) (string, error) {
+	ch, err := parseClientHello(data)
+	if err != nil {
+		log.Debug(err)
+		return "", fmt.Errorf("%w: %w", ErrBadClientHello, err)
+	}
+	return string(ch.extensions[extSNI][5:]), nil
+}
+
+func proxy(upstr upstreamCfg, dialer common.Dialer, conn net.Conn, data []byte) {
+	if upstr.port == "" {
+		_, upstr.port, _ = net.SplitHostPort(conn.LocalAddr().String())
+	}
+	log.Println(upstr)
+
+	upstream, err := dialer.Dial("tcp", upstr.String())
+	if err != nil {
+		log.Errorf("Making connection to domain redirection server: %v", err)
+		return
+	}
+	_, err = upstream.Write(data)
+	if err != nil {
+		log.Error("Failed to send first packet to domain redirection server", err)
+		return
+	}
+	go common.Copy(upstream, conn)
+	go common.Copy(conn, upstream)
+}
+
 func dispatchConnection(conn net.Conn, sta *State) {
 	var err error
 	buf := make([]byte, 1500)
@@ -168,6 +199,16 @@ func dispatchConnection(conn net.Conn, sta *State) {
 			"proxyMethod":      ci.ProxyMethod,
 			"encryptionMethod": ci.EncryptionMethod,
 		}).Warn(err)
+
+		sni, err := getSNI(data)
+		if err != nil {
+			log.WithField("error", err).Error("get SNI")
+		} else {
+			if upstr, ok := sta.Upstreams[sni]; ok {
+				proxy(upstr, sta.RedirDialer, conn, data)
+				return
+			}
+		}
 		goWeb()
 		return
 	}
@@ -260,8 +301,9 @@ func dispatchConnection(conn net.Conn, sta *State) {
 	if !existing {
 		// if the session was newly made, we serve connections from the session streams to the proxy server
 		log.WithFields(log.Fields{
-			"UID":       b64(ci.UID),
-			"sessionID": ci.SessionId,
+			"UID":        b64(ci.UID),
+			"sessionID":  ci.SessionId,
+			"remoteAddr": conn.RemoteAddr(),
 		}).Info("New session")
 
 		serveSession(sesh, ci, user, sta)

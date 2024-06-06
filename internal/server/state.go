@@ -5,8 +5,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io/ioutil"
+	"math/rand"
 	"net"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -25,6 +26,19 @@ type RawConfig struct {
 	DatabasePath string
 	KeepAlive    int
 	CncMode      bool
+	Upstreams    map[string]string
+}
+
+type upstreamCfg struct {
+	host string
+	port string
+}
+
+func (u upstreamCfg) String() string {
+	if u.port == "" {
+		return u.host
+	}
+	return u.host + ":" + u.port
 }
 
 // State type stores the global state of the program
@@ -43,10 +57,24 @@ type State struct {
 	RedirPort   string
 	RedirDialer common.Dialer
 
+	// before redirect if SNI in Upstreams, proxy to corresponding host
+	//if port is omitted, use current connection port
+	Upstreams map[string]upstreamCfg
+
 	usedRandomM sync.RWMutex
 	UsedRandom  map[[32]byte]int64
 
 	Panel *userPanel
+}
+
+// some front adresses.
+var redirs = []string{
+	"104.16.14.135",
+	"162.158.27.87",
+	"197.234.240.45",
+	"3.164.128.33",
+	"34.195.252.3",
+	"180.163.57.130",
 }
 
 func parseRedirAddr(redirAddr string) (net.Addr, string, error) {
@@ -76,7 +104,10 @@ func parseRedirAddr(redirAddr string) (net.Addr, string, error) {
 
 	redirHost, err := net.ResolveIPAddr("ip", host)
 	if err != nil {
-		return nil, "", fmt.Errorf("unable to resolve RedirAddr: %v. ", err)
+		redirHost, err = net.ResolveIPAddr("ip", redirs[rand.Intn(len(redirs))])
+		if err != nil {
+			return nil, "", fmt.Errorf("unable to resolve RedirAddr: %v. ", err)
+		}
 	}
 	return redirHost, port, nil
 }
@@ -111,7 +142,7 @@ func parseProxyBook(bookEntries map[string][]string) (map[string]net.Addr, error
 
 // ParseConfig reads the config file or semicolon-separated options and parse them into a RawConfig
 func ParseConfig(conf string) (raw RawConfig, err error) {
-	content, errPath := ioutil.ReadFile(conf)
+	content, errPath := os.ReadFile(conf)
 	if errPath != nil {
 		errJson := json.Unmarshal(content, &raw)
 		if errJson != nil {
@@ -139,7 +170,20 @@ func InitState(preParse RawConfig, worldState common.WorldState) (sta *State, er
 		UsedRandom:  map[[32]byte]int64{},
 		RedirDialer: &net.Dialer{},
 		WorldState:  worldState,
+		Upstreams:   make(map[string]upstreamCfg, len(preParse.Upstreams)),
 	}
+
+	for sni, addr := range preParse.Upstreams {
+		host, port, err := net.SplitHostPort(addr)
+		if err != nil && !strings.Contains(err.Error(), "missing port in address") {
+			return nil, fmt.Errorf("upstream map %q: %w", addr, err)
+		}
+		if host == "" {
+			host = addr
+		}
+		sta.Upstreams[sni] = upstreamCfg{host, port}
+	}
+
 	if preParse.CncMode {
 		err = errors.New("command & control mode not implemented")
 		return
